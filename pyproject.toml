@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-session-sync"
-version = "0.1.0"
+version = "0.1.1"
 description = "Offline cross-machine sync for Claude Code sessions (JSONL) and memory (.md)."
 readme = "README.md"
 requires-python = ">=3.11"
