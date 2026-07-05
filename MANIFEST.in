@@ -1,0 +1,3 @@
+# sdist 額外收錄（LICENSE 由 pyproject license-files、README 由 readme 已自動收；
+# CHANGELOG 無對應 pyproject 欄位，須在此明列才會進原始碼發佈包）。
+include CHANGELOG.md
