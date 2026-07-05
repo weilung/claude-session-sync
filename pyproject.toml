@@ -3,8 +3,8 @@ requires = ["setuptools>=77.0.3"]   # PEP 639 SPDX license 表達式需 setuptoo
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "claude-session-sync"
-version = "0.3.0"
+name = "claude-code-session-sync"   # PyPI 套件名（指令仍是 claude-session-sync、模組仍是 claude_session_sync）
+version = "0.1.0"
 description = "Offline cross-machine sync for Claude Code sessions (JSONL) and memory (.md)."
 readme = "README.md"
 requires-python = ">=3.11"

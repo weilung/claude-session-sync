@@ -4,9 +4,9 @@ name: publish
 # 觸發：在 public repo weilung/claude-session-sync 開一個 GitHub Release（published）。
 #
 # 一次性設定（在 pypi.org 做，只做一次）：
-#   PyPI → 你的專案 claude-session-sync → Publishing → Add a trusted publisher（GitHub）
+#   PyPI → 你的專案 claude-code-session-sync → Publishing → Add a trusted publisher（GitHub）
 #     Owner:            weilung
-#     Repository name:  claude-session-sync
+#     Repository name:  claude-session-sync   ← repo 沒改名，仍是這個
 #     Workflow name:    publish.yml
 #     Environment name: pypi
 #   （專案還不存在時，改用 "pending publisher"：PyPI → Account → Publishing → 先登記，
@@ -49,3 +49,5 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true   # 重跑同版不報錯（idempotent）

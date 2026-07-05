@@ -19,8 +19,8 @@
 ## 安裝
 
 ```bash
-# 從 PyPI（推薦）
-pipx install claude-session-sync      # 或： pip install claude-session-sync
+# 從 PyPI（推薦）— 套件名 claude-code-session-sync，安裝後指令仍是 claude-session-sync
+pipx install claude-code-session-sync   # 或： pip install claude-code-session-sync
 
 # 或從原始碼安裝最新版
 pipx install "git+https://github.com/weilung/claude-session-sync.git"
