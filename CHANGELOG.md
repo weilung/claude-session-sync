@@ -4,10 +4,10 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.1] — 2026-07-05
+## [0.2.0] — 2026-07-05
 
-First public release. _(0.1.0 was tagged but never published to PyPI — its
-filenames were reserved on PyPI; 0.1.1 is the first release on PyPI.)_
+First public release. _(0.1.0 and 0.1.1 could not be published — their
+filenames were already reserved on PyPI; 0.2.0 is the first release on PyPI.)_
 
 ### Added
 - Offline cross-machine sync for Claude Code sessions (JSONL) and memory (.md)
@@ -26,4 +26,4 @@ filenames were reserved on PyPI; 0.1.1 is the first release on PyPI.)_
 - Cross-platform: Linux + Windows CI on Python 3.11 / 3.13; zero third-party
   dependencies (standard library only).
 
-[0.1.1]: https://github.com/weilung/claude-session-sync/releases/tag/v0.1.1
+[0.2.0]: https://github.com/weilung/claude-session-sync/releases/tag/v0.2.0

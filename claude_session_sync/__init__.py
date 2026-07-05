@@ -8,4 +8,4 @@ P1a 唯讀核心（已實作）：
 依據 DESIGN.md v0.4 附錄 B（P0 spike 定案）與 PLAN-P1.md v0.3。
 """
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
