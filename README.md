@@ -14,7 +14,19 @@
   跨群 `pull`/`push`、`bootstrap` 基線、`doctor` 診斷/rebuild-state/break-lock/ack、
   memory union + tombstone + `MEMORY.md` 索引重建、`memory-merge`（含跨群 `--from` 與模糊近似 `--fuzzy`）、SessionEnd `nudge` hook。
 - memory「同事實不同檔名」的**模糊近似比對**（P2 最後一項、最高風險）已完成——刻意只做**唯讀建議**（`memory-merge --fuzzy` 列候選、由你逐對放行才保留兩版，**絕不自動合併**）。
-- 尚未釋出為 1.0；仍在自用/收斂階段。
+- 首個公開版 **0.1.0（beta）**；尚未到 1.0 穩定版，介面/行為仍可能調整。
+
+## 安裝
+
+```bash
+# 從 PyPI（推薦）
+pipx install claude-session-sync      # 或： pip install claude-session-sync
+
+# 或從原始碼安裝最新版
+pipx install "git+https://github.com/weilung/claude-session-sync.git"
+```
+
+需 Python ≥ 3.11、零第三方相依（標準庫）。安裝後即有 `claude-session-sync` 指令。
 
 ## 快速開始
 

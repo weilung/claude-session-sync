@@ -1,13 +1,35 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77.0.3"]   # PEP 639 SPDX license 表達式需 setuptools>=77
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-session-sync"
-version = "0.0.0"
+version = "0.1.0"
 description = "Offline cross-machine sync for Claude Code sessions (JSONL) and memory (.md)."
+readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "weilung" }]   # 刻意只放名字、不放個人 email（隱私）
+keywords = ["claude", "claude-code", "sync", "sessions", "memory", "jsonl", "offline"]
 dependencies = []          # 決定 #1：零第三方相依（config 用 stdlib tomllib）
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/weilung/claude-session-sync"
+Repository = "https://github.com/weilung/claude-session-sync"
+Issues = "https://github.com/weilung/claude-session-sync/issues"
+Changelog = "https://github.com/weilung/claude-session-sync/blob/main/CHANGELOG.md"
 
 [project.scripts]
 claude-session-sync = "claude_session_sync.cli:main"
