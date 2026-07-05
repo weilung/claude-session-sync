@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-session-sync"
+version = "0.0.0"
+description = "Offline cross-machine sync for Claude Code sessions (JSONL) and memory (.md)."
+requires-python = ">=3.11"
+dependencies = []          # 決定 #1：零第三方相依（config 用 stdlib tomllib）
+
+[project.scripts]
+claude-session-sync = "claude_session_sync.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["claude_session_sync*"]
+
+[tool.setuptools.package-data]
+claude_session_sync = ["py.typed"]

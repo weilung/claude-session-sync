@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Spike working files (合成樣本 / dump 輸出，不入庫)
+spikes/_work/
+*.dump.txt
+*.union.jsonl
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

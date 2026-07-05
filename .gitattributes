@@ -1,0 +1,7 @@
+# 預設文字檔 checkout 用 LF（跨 OS 一致）
+* text=auto eol=lf
+
+# JSONL 不讓 git 動換行/編碼：Spike-4 的跨 OS 逐行 hash 往返測試靠「位元原樣」過 git。
+# 若 git 在 Windows clone 時把 LF 轉 CRLF，會把測試變成「測 git」而非「測 exFAT/Windows」。
+*.jsonl -text
+spikes/fixtures/** -text

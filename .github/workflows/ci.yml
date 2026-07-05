@@ -1,0 +1,40 @@
+name: tests
+
+# 跨 OS CI：claude-session-sync 是跨平台工具，「在 Linux 綠」不等於「在 Windows 對」
+# （O_BINARY 靜默資料毀損就是這樣埋著的）。故 Ubuntu + Windows 都跑：
+#   - Ubuntu  → symlink/大小寫敏感/chmod 不可讀/dead-pid 等能力齊全，tests/_caps.py 的 capability
+#               probe 全 True → 那 ~24 個在 Windows 被 skip 的 POSIX-only 測試在這裡**實跑**（補覆蓋）。
+#   - Windows → 抓 Windows 專屬回歸（換行/路徑/權限語意），確保套件在真 Windows 維持綠。
+# 零第三方相依 → 無需 pip install。
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run test suite
+        run: python -m unittest discover -t . -s tests
+
+  dist-check:
+    name: dist projection · leak + whitelist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # dist repo 不在 CI（只 checkout 了 dev）→ --check 只跑洩漏自掃 + 白名單完整性：
+      # 擋「README 留了指向內部檔的死連結」「寫進維護者絕對路徑」「移除公開路徑」等。
+      - name: Verify public projection
+        run: bash scripts/export-dist.sh --check
