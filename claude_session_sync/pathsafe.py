@@ -23,6 +23,44 @@ def name_key(name: str) -> str:
     return unicodedata.normalize("NFC", unicodedata.normalize("NFC", name).casefold())
 
 
+_WIN_RESERVED_STEMS = {"CON", "PRN", "AUX", "NUL",
+                       *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
+def safe_leaf_name(name: str) -> bool:
+    """跨 OS 安全**單一夾名**——`--map` 目標這類「將被 mkdir／當 state key」的名字用（bootstrap/doctor/transfer
+    共用單一真相源，codex mcwd-r1 F3）。除既有的「非空、單一 component、非 . / ..、非絕對路徑」外，再擋：
+
+    - Windows 不合法字元（`<>:\"/\\|?*` 與控制字元）：`a:b` 在 POSIX 合法但 hub 常在 exFAT/NTFS 外接碟 → 跨 OS 炸；
+    - **尾隨 `.` / 空白**：Win32 路徑正規化會**悄悄剝掉**（`proj.` 實際開/建 `proj`）→ state key 與磁碟名脫鉤、
+      且 `name_key` 撞名檢查看不出（`proj.` ≠ `proj`）＝別名繞過；
+    - 保留裝置名（CON/PRN/AUX/NUL/COM1-9/LPT1-9，含任何副檔名形式如 `CON.txt`）：mkdir 到 apply 才 OSError。
+
+    POSIX 上這些名字雖合法，跨 OS 同步工具的**待建名**採交集最嚴（fail-closed）；既存夾（不經 mkdir）不受此限。"""
+    if not name or name != Path(name).name or name in (".", ".."):
+        return False
+    if any(c in '<>:"/\\|?*' or ord(c) < 32 for c in name):
+        return False
+    if name[-1] in (".", " "):
+        return False
+    if name.split(".", 1)[0].rstrip(" ").upper() in _WIN_RESERVED_STEMS:
+        return False
+    return True
+
+
+def physical_dup_key(p: str | Path) -> str:
+    """dup 偵測用的**實體** canonical 鍵：resolve（跟隨 junction；不存在 → 非嚴格）後之父路徑＋`name_key`
+    摺疊葉名。root 內 junction 別名（`Alias`→`Hub`）與 casefold/NFC 孿生（`Hub`/`hub`）在此鍵下同一
+    （codex mcwd-g4 #1：Path/名字 exact 比對看不出同一實體夾 → 「多 local 配一 hub」防線被 junction 別名
+    繞過 → 空舊夾 false tombstone）。resolve 失敗 → 退回原字串（該夾另由 `safe_project_dir`/掃描擋下）。
+    bootstrap key_dups / scan build_plan dup guard / transfer `_rkey` 共用（單一真相源）。"""
+    try:
+        rp = Path(p).resolve()
+    except OSError:
+        return str(p)
+    return f"{rp.parent}\x00{name_key(rp.name)}"
+
+
 def is_reparse(p: str | Path) -> bool:
     """`p` 的**最終元件**是否為 reparse point（symlink／Windows junction 等），**不跟隨**。跨 OS：POSIX `S_ISLNK`；
     Windows `st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT`（涵蓋 symlink＋junction，因 Windows 無 `O_NOFOLLOW`、

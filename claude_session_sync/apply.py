@@ -135,6 +135,36 @@ class ApplyReport:
         return any(not o.committed for o in self.outcomes)
 
 
+def _state_claims_authorize(st, local_dir: Path, project_key: str):
+    """鎖內以**現時 state 的記載**重演 `scan._bindings_first` 的配對判定（codex mcwd-r1 F1 + mcwd-g1 #3）：
+
+    True＝state 現在仍授權「此 local 夾 ↔ project_key」；False＝授權他處或已撤銷（斷言被撤的 multi-cwd、
+    r26-1 的非斷言 dirmap）；None＝state 無記載（老 state / 純指紋配對）→ 交鎖內 baseline 檢查守住。
+    **精確鏡射解析優先序**（mcwd-g1 #3：只比 claims 不看優先序，會漏「斷言撤銷」又誤擋「stale cwd 綁定＋
+    有效斷言」）：asserted dirmap → 單一 cwd binding → 真空夾 dirmap → multi-cwd/有檔無 cwd 無斷言＝不授權。
+    讀 local 夾失敗 → False（fail-closed：無法驗證就不寫）。"""
+    dirmap = st.local_dir_bindings or {}
+    name = local_dir.name
+    if name in (st.asserted_dirs or set()):
+        pk = dirmap.get(name)
+        if pk:
+            return pk == project_key
+    try:
+        cwds = scan._project_cwds(local_dir)
+        empty = not cwds and not scan._session_files(local_dir)
+    except OSError:
+        return False
+    if len(cwds) == 1:
+        pk = (st.bindings or {}).get(next(iter(cwds)))
+        return (pk == project_key) if pk is not None else None
+    if empty:
+        pk = dirmap.get(name)
+        return (pk == project_key) if pk is not None else None
+    # multi-cwd／有檔無 cwd 且無（有效）斷言：現時解析不會授權任何配對——dirmap 有記載（非斷言）→
+    # r26-1/C-r6-1 不授權 → False；完全無記載 → None（無從否定，老 state 交 baseline 檢查）。
+    return False if dirmap.get(name) else None
+
+
 def _single_cwd(local_dir: Path | None) -> str | None:
     if local_dir is None:
         return None
@@ -193,6 +223,11 @@ def _apply_session(
         return ApplyOutcome(sid, action, "skipped-stale", f"鎖疑似陳舊，交人工處理：{e}")
     except atomicio.LockError as e:
         return ApplyOutcome(sid, action, "skipped-locked", f"取鎖逾時，略過：{e}")
+    except OSError as e:
+        # 取鎖底層是 `os.open(O_CREAT|O_EXCL)`：碟片被拔/唯讀/權限不足/裝置錯誤時丟的是**純 OSError**，
+        # 不是 LockError。取鎖在下方 try 之外 → 原本會直接 traceback 中止整個 sync（codex g11）。
+        # hub 常是可移除式 USB/網路碟 → 這是真實可達的失敗，須逐檔回報而非炸掉整份報告。
+        return ApplyOutcome(sid, action, "error", f"取鎖失敗（碟片不可用/唯讀/權限？）：{atomicio._disp(str(e))}")
     try:
         # leaf symlink 防線（e2e gate3 #1）：鎖內 reclassify 前先擋 symlink .jsonl（TOCTOU：plan/T1 後被換）→ 不讓
         # classify/snapshot 跟隨讀界外（既有 `src.is_symlink()` 在寫入前、太晚，讀已發生；此處提前到讀之前）。
@@ -376,6 +411,16 @@ def _apply_project_memory(
             report.reconcile_failed = True
             report.warnings.append(f"{project_key}: memory 取鎖逾時，未更新 local_memory（請重跑 sync）：{e}")
         return False
+    except OSError as e:   # 純 OSError（碟片被拔/唯讀/權限）→ 逐項回報，不 traceback（codex g11，同 session apply）
+        msg = f"memory 取鎖失敗（碟片不可用/唯讀/權限？）：{atomicio._disp(str(e))}"
+        for m in autos:
+            report.outcomes.append(ApplyOutcome(m.name, m.action, "error", msg, kind="memory"))
+        if not autos:   # 無 auto 項時也要讓 CLI 誠實非零（否則「取鎖失敗」會靜默 exit 0）
+            report.outcomes.append(ApplyOutcome("(memory)", "memory", "error", msg, kind="memory"))
+        if local_dir is not None:
+            report.reconcile_failed = True
+            report.warnings.append(f"{project_key}: {msg}（請重跑 sync）")
+        return False
     try:
         # ① 指紋守衛（掛錯碟）：與 session apply 同基準 base_fp。
         if anomaly.hub_fingerprint(hub_root) != base_fp:
@@ -388,6 +433,28 @@ def _apply_project_memory(
             for m in autos:
                 report.outcomes.append(ApplyOutcome(m.name, m.action, "blocked-uninitialized",
                                                     "專案未 bootstrap → memory 不自動套用", kind="memory"))
+            return False
+        # ②b 綁定守衛（codex mcwd-r1 F1 + mcwd-g1 #3；對稱 session 決策快照的 binding/dir_binding/dir_asserted）：
+        # plan→apply 間此 local 夾可能被 `bootstrap --map`/doctor 重新配對到**別的** hub 專案、或斷言被撤銷。
+        # session 路徑由 per-session `state_entry_hash` 失效擋下；memory 路徑鎖內重跑 `_plan_memories` 用的仍是
+        # **本次配對的 (local_dir, hub_dir)**，不會自己發現配對已改 → 會把重配對後夾的 memory copy 進舊 hub 專案
+        # （跨專案洩漏）、在舊專案寫抑制 tombstone、或把新夾現況 reconcile 進舊 pk 的 local_memory 基線（毒化
+        # 刪除偵測）。守則＝`_state_claims_authorize` 鏡射現時解析：False（授權他處/已撤銷）→ autos 全略過且不
+        # reconcile（fail-closed，請重跑 sync 依新配對重算）；None（老 state 無記載）→ 放行交鎖內權威重分類的
+        # baseline 檢查（blocked-no-baseline → drift skip）守住。
+        # **有界殘留（check-then-act，codex mcwd-g3 #3 PLAUSIBLE、刻意接受）**：守衛與後續寫入/commit 未以
+        # state 鎖全程原子化——通過後另一 process 仍可插入 remap。與 3b2-R2 #1 同一既定姿態（單一操作者、
+        # 非對抗、plan→apply 單次 in-process）；完全關閉需 memory 鎖×state 鎖跨鎖重構，威脅模型下不做。
+        if (local_dir is not None and cur_state is not None
+                and _state_claims_authorize(cur_state, local_dir, project_key) is False):
+            for m in autos:
+                report.outcomes.append(ApplyOutcome(
+                    m.name, m.action, "skipped-changed",
+                    "此 local 夾的配對授權在 apply 中已變（--map/rebuild/斷言撤銷）→ 不依舊配對寫入，請重跑 sync",
+                    kind="memory"))
+            report.reconcile_failed = True
+            report.warnings.append(
+                f"{project_key}: local 夾配對授權已變，未更新 local_memory 基線（請重跑 sync）")
             return False
         has_local_baseline = bool(cur_state and project_key in cur_state.local_memory)
         local_mdir = memory.memory_dir(local_dir) if local_dir is not None else None
@@ -818,18 +885,30 @@ def apply_plan(
         # 由當前 local 現況建立基線，否則下次 sync 會把 hub-only 檔當新檔復活（codex r24-1）；須重 bootstrap。
         # 失敗不擋本次寫入（staleness 由 tombstone 閘遮蔽，下次 sync 重算）。
         if has_local_baseline and local_dir is not None:
-            try:
-                present_stems = scan._session_files(local_dir).keys()
-                tombstoned = {t for (k, t) in tombstone.read_tombstones(hub_dir) if k == "session"}
-                state_mod.reconcile_local_presence(
-                    project_key, present_stems, tombstoned, state_path,
-                    lock_timeout_s=lock_timeout_s, require_baseline=True)
-            except Exception as e:  # noqa: BLE001
-                # 失敗不擋本次寫入，但**須 CLI 非零**（codex 3b2-R1 #3）：local-presence 基線沒落地時，使用者在
-                # 下次成功 sync 前刪掉剛 copy 的檔 → 下次當新檔復活。非零促其重跑（重跑會補上基線）。
+            # 綁定守衛（codex mcwd-g2 #1，對稱 memory 的 ②b）：per-session 寫入由決策快照（binding/dir_binding/
+            # dir_asserted）擋 plan→apply 重新配對，但**專案末 reconcile 沒有快照**——配對若已改指他處，這裡會把
+            # 「新配對夾的現況」寫進**舊 pk** 的 local_sessions 基線 → 毒化舊專案的刪除偵測（日後誤 tombstone）。
+            # False（授權他處/已撤銷）→ 跳過 reconcile 並促重跑；None（老 state 無記載）→ 照常。
+            cur_st = state_mod.load_or_none(state_path)
+            if (cur_st is not None
+                    and _state_claims_authorize(cur_st, local_dir, project_key) is False):
                 report.reconcile_failed = True
                 report.warnings.append(
-                    f"{project_key}: local-presence 追蹤更新失敗（檔已寫，但請重跑 sync 補基線）：{e}")
+                    f"{project_key}: local 夾配對授權已變（--map/rebuild/斷言撤銷）→ 不以舊配對更新 "
+                    f"local-presence 基線（請重跑 sync）")
+            else:
+                try:
+                    present_stems = scan._session_files(local_dir).keys()
+                    tombstoned = {t for (k, t) in tombstone.read_tombstones(hub_dir) if k == "session"}
+                    state_mod.reconcile_local_presence(
+                        project_key, present_stems, tombstoned, state_path,
+                        lock_timeout_s=lock_timeout_s, require_baseline=True)
+                except Exception as e:  # noqa: BLE001
+                    # 失敗不擋本次寫入，但**須 CLI 非零**（codex 3b2-R1 #3）：local-presence 基線沒落地時，使用者在
+                    # 下次成功 sync 前刪掉剛 copy 的檔 → 下次當新檔復活。非零促其重跑（重跑會補上基線）。
+                    report.reconcile_failed = True
+                    report.warnings.append(
+                        f"{project_key}: local-presence 追蹤更新失敗（檔已寫，但請重跑 sync 補基線）：{e}")
 
         # 專案末 memory apply（走獨立 per-project memory 鎖；對稱 session 但跨檔身分需整組原子化，P1d Block 3b-2）。
         if _apply_project_memory(

@@ -35,12 +35,25 @@ class TestCli(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("首次同步", out)
 
+    def test_non_utf8_stdout_does_not_crash(self):
+        """Big5（cp950）主控台＋輸出導向管線：print `⚠` 曾直接 UnicodeEncodeError 炸掉指令。"""
+        buf = io.BytesIO()
+        wrapper = io.TextIOWrapper(buf, encoding="cp950")
+        with contextlib.redirect_stdout(wrapper):
+            code = cli.main(
+                ["status", "--hub", str(self.hub), "--local-root", str(self.local), "--state", str(self.state)]
+            )
+            wrapper.flush()
+        self.assertEqual(code, 0)
+        self.assertIn("⚠", buf.getvalue().decode("utf-8"))
+
     def test_missing_hub_errors(self):
-        # 沒 --hub 且（多半）沒設 config → 期望非零；若環境剛好有 config 則略過
+        # 沒 --hub 也沒 config → 期望非零。patch default_config_path 指向不存在的檔，不再依賴「真機剛好沒 config」
+        #（Windows 的 config 走 %APPDATA%、不讀 XDG → 真機一設過 own_hub 原寫法只能永遠 skip）。
+        from unittest import mock
         from claude_session_sync import config as cfg
-        if cfg.load().own_hub:
-            self.skipTest("環境已設 own_hub")
-        code, _, err = self._run(["status", "--local-root", str(self.local), "--state", str(self.state)])
+        with mock.patch.object(cfg, "default_config_path", return_value=self.tmp / "no-such-config.toml"):
+            code, _, err = self._run(["status", "--local-root", str(self.local), "--state", str(self.state)])
         self.assertEqual(code, 1)
         self.assertIn("own_hub", err)
 
@@ -144,21 +157,50 @@ class TestCli(unittest.TestCase):
 
     def test_corrupt_config_aborts(self):
         # 壞 config（無 --hub）→ 保守中止訊息，非 stack trace（codex r6）
-        import os
+        # patch default_config_path 而非設 XDG_CONFIG_HOME：Windows 的 config 走 %APPDATA%、XDG 隔離是 no-op，
+        # 真機一旦有合法 config（own_hub 在）就讀到真的 → status 正常跑完 exit 0，測試誤紅（2026-07-14 實機中招）。
+        from unittest import mock
+        from claude_session_sync import config as config_mod
         cfgdir = self.tmp / "cfg" / "claude-session-sync"
         cfgdir.mkdir(parents=True)
-        (cfgdir / "config.toml").write_text('force_unsafe_lock = "false"\n', encoding="utf-8")
-        old = os.environ.get("XDG_CONFIG_HOME")
-        os.environ["XDG_CONFIG_HOME"] = str(self.tmp / "cfg")
-        try:
+        cfg_path = cfgdir / "config.toml"
+        cfg_path.write_text('force_unsafe_lock = "false"\n', encoding="utf-8")
+        with mock.patch.object(config_mod, "default_config_path", return_value=cfg_path):
             code, _, err = self._run(["status", "--local-root", str(self.local), "--state", str(self.state)])
-        finally:
-            if old is None:
-                os.environ.pop("XDG_CONFIG_HOME", None)
-            else:
-                os.environ["XDG_CONFIG_HOME"] = old
         self.assertEqual(code, 1)
         self.assertIn("config", err.lower())
+
+    def test_interactive_stdin_eof_skips_gracefully(self):
+        # stdin 斷線（被背景化/管線 EOF）→ 安全跳過、不 traceback（2026-07-14 實機中招：`!` 指令被手動背景化，
+        # auto 項全部落地後才在 input() 崩、exit 1 且吞掉整份報告）。
+        import builtins
+        from unittest import mock
+        from claude_session_sync import resolve as resolve_mod
+        from claude_session_sync.session_merge import MergeOutcome
+        ctx = resolve_mod.ResolveContext("s1", "fork", MergeOutcome.MERGED, "", [])
+        with mock.patch.object(builtins, "input", side_effect=EOFError):
+            d = cli._stdin_decider(ctx)
+        self.assertEqual(d.choice, resolve_mod.Choice.SKIP)
+
+    def test_interactive_tip_eof_skips_gracefully(self):
+        # 同上，但斷在第二題（tip 編號）——選了 u 之後 stdin 才斷也不得 traceback。
+        import builtins
+        from types import SimpleNamespace
+        from unittest import mock
+        from claude_session_sync import resolve as resolve_mod
+        from claude_session_sync.session_merge import MergeOutcome
+        leaves = [SimpleNamespace(uuid="aaaaaaaa-1", ts="2026-07-14T01:00:00Z")]
+        ctx = resolve_mod.ResolveContext("s1", "fork", MergeOutcome.NEEDS_DECISION, "多 leaf", leaves)
+        with mock.patch.object(builtins, "input", side_effect=["u", EOFError]):
+            d = cli._stdin_decider(ctx)
+        self.assertEqual(d.choice, resolve_mod.Choice.SKIP)
+
+    def test_contradictory_map_rejected(self):
+        # codex mcwd-g4 #2：--map 同一 local 夾兩個矛盾目標 → 不可靜默 last-wins（--map 是斷言邊界）→ 非零。
+        code, _, err = self._run(["bootstrap", "--hub", str(self.hub), "--local-root", str(self.local),
+                                  "--state", str(self.state), "--map", "p=A", "--map", "p=B"])
+        self.assertEqual(code, 1)
+        self.assertIn("矛盾", err)
 
     def test_corrupt_state_aborts(self):
         self.state.write_text("{ not json", encoding="utf-8")
@@ -225,23 +267,27 @@ class TestCli(unittest.TestCase):
 
 
 class TestCliTransfer(unittest.TestCase):
-    """跨群 pull/push + remote add/list（隔離 XDG_CONFIG_HOME 以免動到真實 config）。"""
+    """跨群 pull/push + remote add/list（patch default_config_path 隔離，以免動到真實 config）。
+
+    原本設 XDG_CONFIG_HOME 隔離：Windows 的 config 走 %APPDATA%、不讀 XDG → 隔離無效，`remote add` 會把
+    temp 路徑**寫進使用者真實 config**（2026-07-14 實機中招：%APPDATA% config 出現殘留的 Temp remote）。"""
 
     def setUp(self):
+        from unittest import mock
+        from claude_session_sync import config as config_mod
         self._td = tempfile.TemporaryDirectory()
         self.tmp = Path(self._td.name)
         self.local = self.tmp / "local"
         self.remote = self.tmp / "remote"
         (self.local / "projA").mkdir(parents=True)
         (self.remote / "projA").mkdir(parents=True)
-        self._old_xdg = os.environ.get("XDG_CONFIG_HOME")
-        os.environ["XDG_CONFIG_HOME"] = str(self.tmp / "cfg")
+        self._cfg_patch = mock.patch.object(
+            config_mod, "default_config_path",
+            return_value=self.tmp / "cfg" / "claude-session-sync" / "config.toml")
+        self._cfg_patch.start()
+        self.addCleanup(self._cfg_patch.stop)
 
     def tearDown(self):
-        if self._old_xdg is None:
-            os.environ.pop("XDG_CONFIG_HOME", None)
-        else:
-            os.environ["XDG_CONFIG_HOME"] = self._old_xdg
         self._td.cleanup()
 
     def _run(self, argv) -> tuple[int, str, str]:

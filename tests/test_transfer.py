@@ -54,6 +54,16 @@ class TestTransfer(unittest.TestCase):
         self.assertEqual(self._result(report, "s1").result, "copied-to-local")
         self.assertEqual((self.lA / "s1.jsonl").read_bytes(), (self.rA / "s1.jsonl").read_bytes())
 
+    def test_push_dup_missing_targets_casefold_folded(self):
+        # codex mcwd-g2 #4：兩個 --map 指向**皆不存在**的 Hub/hub → exact 不同但 case-insensitive remote 上
+        # mkdir 是同一實體夾 → `_rkey` 葉名摺疊後視為同 target 全數 skip（比照 bootstrap key_dups 摺疊）。
+        lB = self.local / "projB"
+        lB.mkdir()
+        self._w(self.lA / "s1.jsonl", fx.linear())
+        self._w(lB / "s2.jsonl", fx.linear())
+        plan = self._push(mappings={"projA": "Hub", "projB": "hub"})
+        self.assertEqual({p.identity for p in plan.projects if p.local_dir}, {"skipped-dup-target"})
+
     @_caps.needs_case_sensitive_fs
     @_caps.needs_symlink
     def test_push_casefold_symlink_alias_not_clobbered(self):

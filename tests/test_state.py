@@ -53,6 +53,25 @@ class TestState(unittest.TestCase):
         self.assertEqual(back.local_sessions, {})
         self.assertEqual(back.known_sessions, {"projA": {"s1"}})
 
+    def test_asserted_dirs_roundtrip(self):
+        s = st.State(local_dir_bindings={"projM": "encM"}, asserted_dirs={"projM"})
+        p = self.tmp / "state.json"
+        st.save(s, p)
+        back = st.load_or_none(p)
+        self.assertEqual(back.asserted_dirs, {"projM"})
+
+    def test_asserted_dirs_clean_migration(self):
+        # 舊 state（無 asserted_dirs 欄位）載入 → 空集（fail-closed：multi-cwd 夾維持阻擋，重跑 bootstrap --map 才斷言）。
+        p = self.tmp / "state.json"
+        payload = {"schema_version": 1, "hub_fingerprint": None,
+                   "known_sessions": {}, "known_memory": {}, "bindings": {},
+                   "local_dir_bindings": {"projM": "encM"}}
+        doc = {**payload, "_checksum": st._checksum(payload)}
+        p.write_text(json.dumps(doc), encoding="utf-8")
+        back = st.load_or_none(p)
+        self.assertEqual(back.asserted_dirs, set())
+        self.assertEqual(back.local_dir_bindings, {"projM": "encM"})
+
     def test_reconcile_local_presence_merges_pending(self):
         # 新 baseline = present ∪ pending(舊 baseline 中已不在 present 且未 tombstone 者)；不動 known。
         p = self.tmp / "state.json"

@@ -130,6 +130,8 @@ def _resolve_one(
         return ResolveOutcome(sid, "skipped-stale", f"鎖疑似陳舊，交人工：{e}")
     except atomicio.LockError as e:
         return ResolveOutcome(sid, "skipped-locked", f"取鎖逾時，略過：{e}")
+    except OSError as e:   # 純 OSError（碟片被拔/唯讀/權限）→ 逐檔回報，不 traceback（codex g11，同 apply）
+        return ResolveOutcome(sid, "error", f"取鎖失敗（碟片不可用/唯讀/權限？）：{atomicio._disp(str(e))}")
     try:
         # 信任邊界：decider 暫停期間 coverage 可能被移除/損壞 → 鎖內**重讀**，已非 initialized 則不寫（codex r23）。
         cov = tombstone.is_initialized(hub_dir)

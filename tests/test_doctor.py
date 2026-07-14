@@ -157,6 +157,21 @@ class TestDoctor(unittest.TestCase):
         res = doctor.rebuild_state(self.local, self.hub, mappings={"projA": "projA"})
         self.assertEqual(res.state.local_sessions["projA"], {"s1"})
         self.assertEqual(res.state.local_dir_bindings["projA"], "projA")
+        self.assertIn("projA", res.state.asserted_dirs)   # doctor --map 也是明示斷言（2026-07-14）
+
+    def test_rebuild_map_multi_cwd_folder_syncs(self):
+        # 舊死路：multi-cwd 夾 doctor --map 重建出基線，但 sync 端不認（_bindings_first 不看 dirmap）→
+        # 永遠 blocked-multi-cwd。斷言化後 rebuild 的 state 直接可用。
+        from claude_session_sync import scan
+        self._w(self.hA / "s1.jsonl", fx.linear())
+        self._w(self.hA / "s2.jsonl", fx.linear())
+        tombstone.write_coverage(self.hA)
+        fx.write_jsonl([fx.umsg("a1", None, "user", 1, cwd="/home/a")], str(self.lA / "s1.jsonl"))
+        fx.write_jsonl([fx.umsg("b1", None, "user", 1, cwd="/home/b")], str(self.lA / "s2.jsonl"))
+        res = doctor.rebuild_state(self.local, self.hub, mappings={"projA": "projA"})
+        sp = scan.build_plan(self.local, self.hub, res.state)
+        pp = next(x for x in sp.projects if x.local_dir and x.local_dir.endswith("projA"))
+        self.assertEqual(pp.identity, "match")
 
     def test_rebuild_local_excludes_hub_tombstoned(self):
         # codex r-doctor-2：local 基線要扣掉 **hub** 的 tombstone（local 夾本身無 tombstone）。

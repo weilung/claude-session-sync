@@ -45,6 +45,11 @@ class State:
     local_memory: dict[str, set[str]] = field(default_factory=dict)     # project_key -> **local** 端 memory 檔名集（對稱刪除追蹤，P1d）
     bindings: dict[str, str] = field(default_factory=dict)              # local_cwd -> hub_project_key (A17.4)
     local_dir_bindings: dict[str, str] = field(default_factory=dict)    # local 夾名 -> hub_project_key（供 session 全刪、無 cwd 可解析的空夾仍能配對，P1c）
+    # 使用者以 --map **明示斷言**過夾名綁定的 local 夾名集（bootstrap/doctor --map 寫；決定 2026-07-14）。
+    # 只有在此集合內的夾，sync 身分解析才允許「無視 cwd 數、直接採 local_dir_bindings」——區分「使用者斷言」與
+    # r26-1 擋下的「夾名弱猜」（自動配對也會寫 dirmap，故需此 provenance，否則 C-r6-1 的 multi-cwd 防護形同作廢）。
+    # 舊 state 缺此欄位 → 空集（fail-closed：multi-cwd 夾維持阻擋，重跑 bootstrap --map 一次即斷言）。
+    asserted_dirs: set[str] = field(default_factory=set)
     schema_version: int = SCHEMA_VERSION
     path: str | None = None
 
@@ -58,6 +63,7 @@ class State:
             "local_memory": {k: sorted(v) for k, v in self.local_memory.items()},
             "bindings": dict(self.bindings),
             "local_dir_bindings": dict(self.local_dir_bindings),
+            "asserted_dirs": sorted(self.asserted_dirs),
         }
 
 
@@ -86,6 +92,8 @@ def load_or_none(path: str | os.PathLike | None = None) -> State | None:
             local_memory={k: set(v) for k, v in payload.get("local_memory", {}).items()},
             bindings=dict(payload.get("bindings", {})),
             local_dir_bindings=dict(payload.get("local_dir_bindings", {})),
+            # 舊 state 缺 asserted_dirs → 空集（fail-closed：multi-cwd 夾維持阻擋，待使用者重跑 bootstrap --map 斷言）。
+            asserted_dirs={str(x) for x in payload.get("asserted_dirs", [])},
             schema_version=int(payload.get("schema_version", SCHEMA_VERSION)),
             path=str(p),
         )

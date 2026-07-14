@@ -226,6 +226,26 @@ class TestApply(unittest.TestCase):
         self.assertEqual(r.result, "reported")
         self.assertFalse((self.hA / "s1.jsonl").exists())  # 未復活/未寫 hub
 
+    def test_lock_oserror_reported_not_crash(self):
+        # codex g11：取鎖底層是 os.open(O_CREAT|O_EXCL)。碟片被拔/唯讀/權限不足 → 丟**純 OSError**（非
+        # LockError），而取鎖在 try 之外 → 原本會 traceback 中止整個 sync。hub 常是可移除式 USB/網路碟 →
+        # 必須逐檔回報 error（該檔失敗、其餘照跑、CLI 誠實非零），不可炸掉整份報告。
+        self._w(self.lA / "s1.jsonl", fx.linear())
+        tombstone.write_coverage(self.hA)
+        st = state_mod.State(known_sessions={"projA": set()})
+        plan = scan.build_plan(self.local, self.hub, st, identity_fn=_name_match)
+
+        def boom(self, **kw):
+            raise PermissionError(13, "The device is not ready")   # 模擬 USB 被拔/唯讀
+
+        with mock.patch.object(atomicio.FileLock, "acquire_blocking", boom):
+            report = self._apply(plan, state=st)                   # 不可 raise
+        r = self._result(report, "s1")
+        self.assertEqual(r.result, "error")
+        self.assertIn("取鎖失敗", r.detail)
+        self.assertTrue(report.had_error)                          # CLI 會回非零
+        self.assertFalse((self.hA / "s1.jsonl").exists())          # 未寫入任何東西
+
     def test_paired_identical_to_base_suppressed_by_tombstone(self):
         # 兩側 byte-identical 且 == base → suppressed-deleted（不復活、不寫）。
         self._w(self.lA / "s1.jsonl", fx.linear())

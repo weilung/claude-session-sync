@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -27,6 +28,7 @@ from .pathsafe import list_project_dirs as _list_project_dirs  # noqa: F401  (re
 from .pathsafe import safe_project_dir as _safe_project_dir  # noqa: F401  (re-export)
 from .pathsafe import within_root as _within_root  # noqa: F401  (re-export)
 from .pathsafe import name_key as _name_key  # noqa: F401  (re-export；NFC∘casefold∘NFC 單一真相源在 pathsafe，anomaly/memory 亦 import)
+from .pathsafe import physical_dup_key as _physical_dup_key  # noqa: F401  (dup 防線實體鍵；bootstrap/transfer 同把)
 from .sidecar import MatchStatus
 from .state import State
 
@@ -61,6 +63,8 @@ class ProjectPlan:
     notes: list[str] = field(default_factory=list)
     memory_scan_failed: bool = False   # memory 規劃被跳過（memory/ symlink/不可讀）→ memories 不可信為「全部」
     #   （結構化旗標，非靠 note 文字；memory-merge 須據此 surface + 非零，不可 recheck 成功就抹掉 plan 的跳過事實，gate4 F3）
+    dup_hub: str | None = None   # blocked-dup-local 時＝原本會配到的 hub 夾名（mcwd-g3 #1 擋下時 hub_dir 設 None
+    #   免下游誤當已配對；此欄位保留 pk 供 `_dup_target_pks`/fuzzy 聚合維持「撞夾 → 大聲警告＋非零」的既有回報）
 
 
 @dataclass
@@ -146,16 +150,29 @@ def _bindings_first(
     """先採 state 的持久綁定（cwd→hub project_key，由 bootstrap/`--map` 寫入，A17.4），再退回 git 指紋。
 
     使用者明示的綁定**優先於**啟發式 git 指紋。綁定指向的 hub 夾若當前不在（掛錯碟/被刪）→ needs-map，
-    不憑空配對。多 cwd 同夾不採綁定（夾名有損，交原解析判 blocked-multi-cwd）。
+    不憑空配對。多 cwd 同夾不採 cwd 綁定（夾名有損，交原解析判 blocked-multi-cwd）——**除非**該夾名在
+    `asserted_dirs`（使用者以 --map **斷言整個夾**，決定 2026-07-14）：斷言夾無視 cwd 數，直接採夾名綁定。
+    這是「使用者斷言」與 r26-1 擋下的「夾名弱猜」的分界：搬機/repo 改名造成的混 cwd 夾（Debian→Windows
+    遺留）得以斷言後同步；未斷言的夾（含自動配對寫入的 dirmap）防護原封不動。
     **空夾**（session 全刪 → 無 cwd 可解析身分）改採持久化的**夾名綁定**（local_dir_bindings），否則
     「刪到空」的專案無法配對 → 對稱刪除偵測抓不到（codex r25）。夾名為 FS 既有路徑、不做編碼弱猜（決定#7）。
     """
     bmap = (state.bindings if state else {}) or {}
     dirmap = (state.local_dir_bindings if state else {}) or {}
+    asserted = (state.asserted_dirs if state else set()) or set()
     if not bmap and not dirmap:
         return resolve
 
     def wrapped(local_dir: Path, hub_dirs: list[Path]) -> tuple[str, Path | None]:
+        if local_dir.name in asserted:
+            pk_a = dirmap.get(local_dir.name)
+            if pk_a:
+                # 斷言夾：使用者親口說「這整個夾＝那個 hub 專案」→ 不看 cwd（混多少種歷史 cwd 都照配）。
+                for hd in hub_dirs:
+                    if hd.name == pk_a:
+                        return ("match", hd)
+                return ("needs-map", None)  # 斷言綁定的 hub 夾不在 → 不憑空配對
+            # 斷言存在但 dirmap 缺（state 被手改/部分重建）→ 斷言無所指，落回一般解析（fail-closed）。
         cwds = _project_cwds(local_dir)
         pk = None
         if len(cwds) == 1:
@@ -363,8 +380,23 @@ def build_plan(
             local_dir=None, hub_dir=str(hd), identity="skipped-unsafe", coverage_initialized=False,
             notes=["hub 專案夾是 symlink 或逃逸 hub_root → 跳過（不讀/寫信任根外）"]))
     matched_hub: set[Path] = set()
+    # 先全數解析，攔「多個 local 夾配到**同一** hub 專案」（codex mcwd-g3 #1）：remap 撤舊不完全/手改 state/
+    # 部分重建都可能殘留兩夾同 claims → 空的舊夾會把 hub 檔判 local-deleted 寫 **false tombstone**、或把舊夾
+    # 內容誤 copy 進 hub。發現即全數阻擋（不挑，比照 bootstrap dup-key guard），交使用者重 bootstrap 釐清。
+    resolved: list[tuple[Path, str, Path | None]] = []
     for ld in local_dirs:
         status, hub_dir = resolve(ld, hub_dirs)
+        resolved.append((ld, status, hub_dir))
+    # 以**實體** canonical 鍵計 dup（mcwd-g4 #1）：root 內 junction 別名（Alias→Hub）exact Path 不同但同一
+    # 實體夾——只比 Path 會讓「多 local 配一 hub」防線被別名繞過。
+    dup_keys = {k for k, n in Counter(
+        _physical_dup_key(hd) for _, st, hd in resolved if st == "match" and hd is not None).items() if n > 1}
+    dup_hub_name: dict[Path, str] = {}
+    for i, (ld, status, hub_dir) in enumerate(resolved):
+        if status == "match" and hub_dir is not None and _physical_dup_key(hub_dir) in dup_keys:
+            dup_hub_name[ld] = hub_dir.name   # 保留 pk 供回報（hub_dir 本身設 None 免下游當已配對）
+            resolved[i] = (ld, "blocked-dup-local", None)
+    for ld, status, hub_dir in resolved:
         if hub_dir:
             matched_hub.add(hub_dir)
         cov = tombstone.is_initialized(hub_dir) if hub_dir else False
@@ -374,7 +406,11 @@ def build_plan(
         has_baseline = bool(state and hub_dir and hub_dir.name in state.known_sessions)
         local_known = (state.local_sessions.get(hub_dir.name) if (state and hub_dir) else None)
         has_local_baseline = bool(state and hub_dir and hub_dir.name in state.local_sessions)
-        notes = [] if hub_dir else [f"未對應到 hub 專案（{status}）；需 --map / bootstrap"]
+        _note_map = {
+            "blocked-multi-cwd": f"未對應到 hub 專案（{status}）；夾內混多種 cwd → 用 `bootstrap --map` 明示斷言整夾",
+            "blocked-dup-local": "多個 local 夾配到同一 hub 專案 → 全數阻擋（false-tombstone/互寫風險；請重跑 bootstrap 釐清綁定）",
+        }
+        notes = [] if hub_dir else [_note_map.get(status, f"未對應到 hub 專案（{status}）；需 --map / bootstrap")]
         mem_scan_failed = False
         try:
             mem_plans = _plan_memories(ld, hub_dir, state=state, cov=cov, tombs=tombs, corrupt=corrupt)
@@ -398,6 +434,7 @@ def build_plan(
                 memories=mem_plans,
                 notes=notes,
                 memory_scan_failed=mem_scan_failed,
+                dup_hub=dup_hub_name.get(ld),
             )
         )
 

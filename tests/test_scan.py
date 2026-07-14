@@ -309,6 +309,97 @@ class TestBuildPlan(unittest.TestCase):
         pp = next(p for p in plan.projects if p.local_dir and p.local_dir.endswith("projL"))
         self.assertEqual(pp.identity, "needs-map")   # 有檔但無 cwd → 不夾名誤配
 
+    def _mk_multi_cwd(self, name="projL"):
+        px = self.local_root / name
+        px.mkdir()
+        fx.write_jsonl([fx.umsg("a1", None, "user", 1, cwd="/home/a")], str(px / "s1.jsonl"))
+        fx.write_jsonl([fx.umsg("b1", None, "user", 1, cwd="/home/b")], str(px / "s2.jsonl"))
+        return px
+
+    def test_asserted_dir_matches_despite_multi_cwd(self):
+        # --map 斷言整夾（決定 2026-07-14）：asserted 夾無視 cwd 數，直接採夾名綁定（Debian→Windows 搬遷
+        # 混 cwd 夾的解法；斷言 vs r26-1 弱猜的分界）。
+        from claude_session_sync.state import State
+        self._mk_multi_cwd()
+        (self.hub_root / "encH").mkdir()
+        st = State(local_dir_bindings={"projL": "encH"}, asserted_dirs={"projL"})
+        plan = scan.build_plan(self.local_root, self.hub_root, st)
+        pp = next(p for p in plan.projects if p.local_dir and p.local_dir.endswith("projL"))
+        self.assertEqual(pp.identity, "match")
+        self.assertTrue(pp.hub_dir.endswith("encH"))
+
+    def test_asserted_dir_missing_hub_is_needs_map(self):
+        # 斷言綁定的 hub 夾不在（掛錯碟/被刪）→ needs-map，不憑空配對（沿用綁定既有鐵則）。
+        from claude_session_sync.state import State
+        self._mk_multi_cwd()
+        st = State(local_dir_bindings={"projL": "gone"}, asserted_dirs={"projL"})
+        plan = scan.build_plan(self.local_root, self.hub_root, st)
+        pp = next(p for p in plan.projects if p.local_dir and p.local_dir.endswith("projL"))
+        self.assertEqual(pp.identity, "needs-map")
+
+    def test_unasserted_dirmap_multi_cwd_still_blocked(self):
+        # 只有 dirmap、沒有斷言（自動配對寫入的夾名綁定）→ multi-cwd 照擋（C-r6-1 防護不因 dirmap 存在而失效）。
+        from claude_session_sync.state import State
+        self._mk_multi_cwd()
+        (self.hub_root / "encH").mkdir()
+        st = State(local_dir_bindings={"projL": "encH"})
+        plan = scan.build_plan(self.local_root, self.hub_root, st)
+        pp = next(p for p in plan.projects if p.local_dir and p.local_dir.endswith("projL"))
+        self.assertEqual(pp.identity, "blocked-multi-cwd")
+
+    def test_dup_local_dirs_same_hub_all_blocked(self):
+        # codex mcwd-g3 #1 防線：兩個 local 夾（legacy state 殘留的雙 claims）同配到一個 hub 專案 →
+        # 全數 blocked-dup-local——否則空舊夾會把 hub 檔判 local-deleted 寫 false tombstone / 互寫。
+        from claude_session_sync.state import State
+        (self.local_root / "oldF").mkdir()             # 空舊夾（殘留 dirmap+asserted）
+        newf = self.local_root / "newF"
+        newf.mkdir()
+        fx.write_jsonl(fx.linear(), str(newf / "s1.jsonl"))
+        hd = self.hub_root / "encH"
+        hd.mkdir()
+        fx.write_jsonl(fx.linear(), str(hd / "s1.jsonl"))
+        tombstone.write_coverage(hd)
+        st = State(known_sessions={"encH": {"s1"}}, local_sessions={"encH": {"s1"}},
+                   local_dir_bindings={"oldF": "encH", "newF": "encH"},
+                   asserted_dirs={"oldF", "newF"})
+        plan = scan.build_plan(self.local_root, self.hub_root, st)
+        by_dir = {Path(p.local_dir).name: p.identity for p in plan.projects if p.local_dir}
+        self.assertEqual(by_dir.get("oldF"), "blocked-dup-local")
+        self.assertEqual(by_dir.get("newF"), "blocked-dup-local")
+        for pp in plan.projects:
+            for sp in pp.sessions:
+                self.assertNotEqual(sp.action, "local-deleted")   # 空舊夾不得產生 false 刪除
+
+    @_caps.needs_junction
+    def test_junction_alias_hub_dup_blocked(self):
+        # codex mcwd-g4 #1：hub root **內**的 junction 別名（Alias→Hub，政策上安全）＝同一實體夾——
+        # 兩 local 各配 Hub/Alias，exact Path 不同、實體同一 → 仍須全數 blocked-dup-local。
+        from claude_session_sync.state import State
+        la = self.local_root / "locA"
+        lb = self.local_root / "locB"
+        la.mkdir()
+        lb.mkdir()
+        fx.write_jsonl(fx.linear(), str(la / "s1.jsonl"))
+        fx.write_jsonl(fx.linear(), str(lb / "s2.jsonl"))
+        hub = self.hub_root / "Hub"
+        hub.mkdir()
+        _caps.make_junction(self.hub_root / "Alias", hub)
+        st = State(local_dir_bindings={"locA": "Hub", "locB": "Alias"}, asserted_dirs={"locA", "locB"})
+        plan = scan.build_plan(self.local_root, self.hub_root, st)
+        by_dir = {Path(p.local_dir).name: p.identity for p in plan.projects if p.local_dir}
+        self.assertEqual(by_dir.get("locA"), "blocked-dup-local")
+        self.assertEqual(by_dir.get("locB"), "blocked-dup-local")
+
+    def test_asserted_without_dirmap_falls_back(self):
+        # 斷言在、dirmap 缺（state 被手改/部分重建）→ 斷言無所指 → 落回一般解析（multi-cwd 擋下，fail-closed）。
+        from claude_session_sync.state import State
+        self._mk_multi_cwd()
+        (self.hub_root / "encH").mkdir()
+        st = State(bindings={"/unrelated": "encH"}, asserted_dirs={"projL"})   # bindings 非空 → wrapper 生效
+        plan = scan.build_plan(self.local_root, self.hub_root, st)
+        pp = next(p for p in plan.projects if p.local_dir and p.local_dir.endswith("projL"))
+        self.assertEqual(pp.identity, "blocked-multi-cwd")
+
     def test_empty_local_dir_multi_session_blocked_bulk(self):
         # 空夾且曾有 ≥2 session → 掛載無法確認（present 空）→ blocked-bulk（不自動寫 tombstone）。
         from claude_session_sync.state import State

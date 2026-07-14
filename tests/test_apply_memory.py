@@ -762,5 +762,92 @@ class TestApplyMemoryIndex(_MemApplyHarness, unittest.TestCase):
         self.assertTrue(any("損壞" in w and "broken.md" in w for w in report.warnings))
 
 
+class TestApplyMemoryBindingGuard(_MemApplyHarness, unittest.TestCase):
+    """codex mcwd-r1 F1：plan→apply 間此 local 夾被重新配對（--map/rebuild）→ memory autos 全略過、不 reconcile。
+    session 路徑由 per-session 決策快照（binding/dir_binding/dir_asserted）擋；memory 路徑靠鎖內綁定守衛。"""
+
+    def test_dir_binding_remap_between_plan_and_apply_skips(self):
+        self._wm(self.lA, "new.md", _mem("new"))
+        plan = self._plan()
+        st = state_mod.load_or_none(self.state)
+        st.local_dir_bindings["projA"] = "projB"      # 併發 remap：夾名綁定改指他處
+        state_mod.save(st, self.state)
+        report = self._apply(plan, state=st)
+        out = self._r(report, "new.md")
+        self.assertEqual(out.result, "skipped-changed")
+        self.assertFalse(self._mfile(self.hA, "new.md").exists())   # 未把新配對夾的 memory 寫進舊 hub 專案
+        self.assertTrue(report.reconcile_failed)                     # 舊 pk 的 local_memory 基線未被毒化
+        self.assertEqual(self._ldmem(), set())
+
+    def test_cwd_binding_remap_between_plan_and_apply_skips(self):
+        from tests import fixtures as fx
+        fx.write_jsonl([fx.umsg("u1", None, "user", 1, cwd="/work/A")], str(self.lA / "s1.jsonl"))
+        self._wm(self.lA, "new.md", _mem("new"))
+        plan = self._plan()
+        st = state_mod.load_or_none(self.state)
+        st.bindings["/work/A"] = "projB"              # 併發 remap：單一 cwd 綁定改指他處
+        state_mod.save(st, self.state)
+        report = self._apply(plan, state=st)
+        self.assertEqual(self._r(report, "new.md").result, "skipped-changed")
+        self.assertFalse(self._mfile(self.hA, "new.md").exists())
+
+    def test_matching_binding_still_applies(self):
+        # 綁定記載且**仍指向本 pk** → 照常寫（守衛不誤傷正常路徑）。
+        self._wm(self.lA, "new.md", _mem("new"))
+        plan = self._plan()
+        st = state_mod.load_or_none(self.state)
+        st.local_dir_bindings["projA"] = "projA"
+        state_mod.save(st, self.state)
+        report = self._apply(plan, state=st)
+        self.assertEqual(self._r(report, "new.md").result, "copied-to-hub")
+
+    def test_assertion_revoked_mid_apply_skips(self):
+        # codex mcwd-g1 #3A：plan 時斷言 multi-cwd 配對；apply 前斷言被撤（dirmap 仍同 pk）→ 授權已失 → skip
+        # （非斷言 dirmap 對非空夾不授權，r26-1 鏡射；只比 claims 值會漏掉這型）。
+        from tests import fixtures as fx
+        fx.write_jsonl([fx.umsg("a1", None, "user", 1, cwd="/home/a")], str(self.lA / "s1.jsonl"))
+        fx.write_jsonl([fx.umsg("b1", None, "user", 1, cwd="/home/b")], str(self.lA / "s2.jsonl"))
+        self._wm(self.lA, "new.md", _mem("new"))
+        st = state_mod.load_or_none(self.state)
+        st.local_dir_bindings["projA"] = "projA"
+        st.asserted_dirs = {"projA"}
+        state_mod.save(st, self.state)
+        plan = self._plan()
+        st2 = state_mod.load_or_none(self.state)
+        st2.asserted_dirs = set()                     # 併發撤銷斷言（dirmap 不動）
+        state_mod.save(st2, self.state)
+        report = self._apply(plan, state=st2)
+        self.assertEqual(self._r(report, "new.md").result, "skipped-changed")
+        self.assertFalse(self._mfile(self.hA, "new.md").exists())
+
+    def test_session_reconcile_skipped_on_remap(self):
+        # codex mcwd-g2 #1：專案末 session local-presence reconcile 也須受綁定守衛——否則配對改指他處後，
+        # 舊 pk 的 local_sessions 基線被「新配對夾的現況」覆寫（毒化舊專案刪除偵測、日後誤 tombstone）。
+        from tests import fixtures as fx
+        fx.write_jsonl(fx.linear(), str(self.lA / "s1.jsonl"))
+        self._save(known_mem=set(), local_mem=set(), known_sess={"sOld"}, local_sess={"sOld"})
+        plan = self._plan()
+        st = state_mod.load_or_none(self.state)
+        st.local_dir_bindings["projA"] = "projB"      # 併發 remap
+        state_mod.save(st, self.state)
+        report = self._apply(plan, state=st)
+        s_after = state_mod.load_or_none(self.state)
+        self.assertEqual(s_after.local_sessions["projA"], {"sOld"})   # 基線未被現況 {"s1"} 毒化
+        self.assertTrue(report.reconcile_failed)
+
+    def test_stale_cwd_binding_with_valid_assertion_not_blocked(self):
+        # codex mcwd-g1 #3B：asserted dirmap 命中（優先序最高）→ 忽略 stale cwd binding，不誤擋正常配對。
+        from tests import fixtures as fx
+        fx.write_jsonl([fx.umsg("u1", None, "user", 1, cwd="/old")], str(self.lA / "s1.jsonl"))
+        self._wm(self.lA, "new.md", _mem("new"))
+        st = state_mod.load_or_none(self.state)
+        st.bindings["/old"] = "oldHub"                # 舊 state 殘留的 cwd 綁定（指向他處）
+        st.local_dir_bindings["projA"] = "projA"
+        st.asserted_dirs = {"projA"}
+        state_mod.save(st, self.state)
+        report = self._apply(self._plan(), state=state_mod.load_or_none(self.state))
+        self.assertEqual(self._r(report, "new.md").result, "copied-to-hub")
+
+
 if __name__ == "__main__":
     unittest.main()

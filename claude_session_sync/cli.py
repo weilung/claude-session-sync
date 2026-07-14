@@ -65,13 +65,21 @@ def _resolve_context(args) -> tuple[Context | None, str | None]:
 
 
 def _stdin_decider(ctx: resolve_mod.ResolveContext) -> resolve_mod.Decision:
-    """CLI 互動 decider：對每個 fork/superset 問 [u]nion / keep-[b]oth / [s]kip。"""
+    """CLI 互動 decider：對每個 fork/superset 問 [u]nion / keep-[b]oth / [s]kip。
+
+    stdin 斷線（EOFError：行程被背景化/stdin 是管線且已耗盡）→ **安全跳過**、不 traceback——否則
+    `sync --apply --interactive` 在 auto 項全部落地後才崩，exit 1 且吞掉整份報告（2026-07-14 實機中招：
+    使用者的 `!` 指令被手動背景化）。比照 fuzzy decider 的 EOF→N。"""
     can_union = ctx.union_outcome != MergeOutcome.FALLBACK
     print(f"\n  fork/superset: {ctx.session_id[:8]}（{ctx.action}）")
     menu = (["[u] union 合併兩枝"] if can_union else [f"（union 不可用：{ctx.union_reason}）"]) + \
            ["[b] keep-both（把 hub 分枝帶進 local）", "[s] 跳過"]
     print("    " + "   ".join(menu))
-    ans = input("    選擇 [u/b/s]: ").strip().lower()
+    try:
+        ans = input("    選擇 [u/b/s]: ").strip().lower()
+    except EOFError:
+        print("    （stdin 已斷 → 跳過）")
+        return resolve_mod.Decision(resolve_mod.Choice.SKIP)
     if ans == "u" and can_union:
         tip = None
         if ctx.union_outcome == MergeOutcome.NEEDS_DECISION:
@@ -80,8 +88,8 @@ def _stdin_decider(ctx: resolve_mod.ResolveContext) -> resolve_mod.Decision:
                 print(f"      ({i}) {lf.uuid[:8]} ts={lf.ts}")
             try:
                 tip = ctx.leaves[int(input("    tip 編號: ").strip())].uuid
-            except (ValueError, IndexError):
-                print("    無效編號 → 跳過")
+            except (ValueError, IndexError, EOFError):
+                print("    無效編號/輸入中斷 → 跳過")
                 return resolve_mod.Decision(resolve_mod.Choice.SKIP)
         return resolve_mod.Decision(resolve_mod.Choice.UNION, chosen_tip=tip)
     if ans == "b":
@@ -143,6 +151,9 @@ def _parse_maps(items: list[str] | None) -> tuple[dict[str, str], str | None]:
         k, v = it.split("=", 1)
         if not k or not v:
             return {}, f"--map 兩側不可空：{it}"
+        if k in out and out[k] != v:
+            # --map 是斷言邊界（2026-07-14）：同一 local 夾兩個矛盾目標不可靜默 last-wins（codex mcwd-g4 #2）。
+            return {}, f"--map 對同一 local 夾指定了矛盾目標：{k}={out[k]} 與 {k}={v}，請擇一"
         out[k] = v
     return out, None
 
@@ -265,11 +276,15 @@ def _dup_target_pks(plan, project: str | None = None) -> frozenset[str]:
     `project` 給定時只算該 pk（g2 Medium：否則 scoped 指令會被無關專案的 dup 誤觸警告/非零）。"""
     counts: dict[str, int] = {}
     for pp in plan.projects:
-        if pp.local_dir and pp.hub_dir:
-            pk = Path(pp.hub_dir).name
-            if project is not None and pk != project:
-                continue
-            counts[pk] = counts.get(pk, 0) + 1
+        # blocked-dup-local（scan 上游已擋、hub_dir=None）帶 dup_hub＝原會配到的 pk → 一樣計入，
+        # 維持「撞夾 → 大聲警告＋非零」的既有回報（否則上游擋掉反而變靜默 exit 0，mcwd-g3 #1 修正的回歸）。
+        pk = (Path(pp.hub_dir).name if (pp.local_dir and pp.hub_dir)
+              else pp.dup_hub if pp.local_dir else None)
+        if pk is None:
+            continue
+        if project is not None and pk != project:
+            continue
+        counts[pk] = counts.get(pk, 0) + 1
     return frozenset(pk for pk, c in counts.items() if c > 1)
 
 
@@ -563,7 +578,9 @@ def _cmd_memory_merge_fuzzy(args) -> int:
     _pk_locals: dict[str, set] = {}
     _pk_hubs: dict[str, set] = {}
     for _pp in plan.projects:
-        _pk = Path(_pp.hub_dir).name if _pp.hub_dir else (Path(_pp.local_dir).name if _pp.local_dir else None)
+        # dup_hub（blocked-dup-local 保留的原 pk）優先：兩夾同綁一 hub 被上游擋後，仍須落同一 pk 桶才抓得到 dup。
+        _pk = _pp.dup_hub or (Path(_pp.hub_dir).name if _pp.hub_dir
+                              else (Path(_pp.local_dir).name if _pp.local_dir else None))
         if _pk is None:
             continue
         if _pp.local_dir:
@@ -586,7 +603,8 @@ def _cmd_memory_merge_fuzzy(args) -> int:
     score_src: dict[str, dict[str, tuple[str, Path]]] = {}
     unscannable: list[str] = []
     for pp in plan.projects:
-        pk = Path(pp.hub_dir).name if pp.hub_dir else (Path(pp.local_dir).name if pp.local_dir else None)
+        pk = pp.dup_hub or (Path(pp.hub_dir).name if pp.hub_dir
+                            else (Path(pp.local_dir).name if pp.local_dir else None))
         if pk is None:
             continue
         if args.project is not None and pk != args.project:
@@ -941,7 +959,21 @@ def _cmd_nudge(args) -> int:
     return 0
 
 
+def _utf8_output() -> None:
+    """把 stdout/stderr 轉成 UTF-8。
+
+    Windows 非 UTF-8 code page（如 cp950/Big5）下，stdout 一被導向管線或檔案，Python 就改用 locale 編碼，
+    輸出裡的 `⚠` 等字元直接 UnicodeEncodeError → 整個指令炸掉（連唯讀的 status 也是）。
+    """
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:  # noqa: BLE001 — 被替換成非 TextIOWrapper（測試捕捉/重導）→ 維持原樣，不讓它擋住指令。
+            pass           # 寬接：本函式在 main() 最前、nudge 的 fail-silent 網之外，任何例外逃出都會破壞 hook 鐵則。
+
+
 def main(argv: list[str] | None = None) -> int:
+    _utf8_output()
     p = argparse.ArgumentParser(prog="claude-session-sync", description="跨機同步 Claude Code session/memory")
     sub = p.add_subparsers(dest="cmd", required=True)
 

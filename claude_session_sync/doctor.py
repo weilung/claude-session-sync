@@ -16,7 +16,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import acks, anomaly, atomicio, scan, state as state_mod, tombstone
+from . import acks, anomaly, atomicio, pathsafe, scan, state as state_mod, tombstone
 from .config import Config
 from .state import State
 
@@ -24,8 +24,9 @@ _LOCK_SUFFIX = ".lock"
 
 
 def _safe_name(name: str) -> bool:
-    """`--map` 夾名須是 root 底下單一安全夾名（非空、無分隔、非 . / ..、非絕對），擋逃出信任根（比照 bootstrap）。"""
-    return bool(name) and name == Path(name).name and name not in (".", "..")
+    """`--map` 夾名須是 root 底下單一安全夾名，擋逃出信任根（比照 bootstrap）。委派 `pathsafe.safe_leaf_name`
+    （單一真相源；另擋 Windows 保留名/非法字元/尾隨點空白，codex mcwd-r1 F3）。"""
+    return pathsafe.safe_leaf_name(name)
 
 
 def _safe_dir(root: Path, d: Path) -> bool:
@@ -328,6 +329,9 @@ def rebuild_state(
             continue
         st.local_sessions[hub_name] = _live_stems(ld, hd)   # tombstone 由 **hub** 夾讀（codex r-doctor-2）
         st.local_dir_bindings[local_name] = hub_name
+        # doctor --map 同為使用者明示 → 寫斷言（否則 multi-cwd 夾 rebuild 出的基線 sync 端仍配不上＝死路，
+        # 2026-07-13 實機中招；與 bootstrap --map 一致，決定 2026-07-14）。
+        st.asserted_dirs.add(local_name)
         cwds = scan._project_cwds(ld)
         if len(cwds) == 1:
             st.bindings[next(iter(cwds))] = hub_name

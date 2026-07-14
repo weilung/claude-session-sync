@@ -66,6 +66,45 @@ class TestSessionMerge(unittest.TestCase):
         self.assertNotIn("custom-title", types)
         self.assertNotIn("mode", types)
 
+    def test_volatile_meta_with_uuid_not_carried_nor_chosen_as_tip(self):
+        # codex g3：畸形的揮發 meta 行**帶 uuid**（schema 未禁止）→ 舊 `_is_content_line`（有 uuid 就算內容）
+        # 會把它搬進 union、且舊的本地 leaf 述詞會把它當 genuine leaf → 依 ts 自動選中它當 tip →
+        # 合併檔的游標指向一條 metadata。修法＝union 不搬揮發 meta（即使帶 uuid）＋ leaf 判定用 lineset 單一真相源。
+        r = merge_sessions(self._shape(fx.linear()), self._shape(fx.meta_line_with_uuid_branch()))
+        if r.outcome is MergeOutcome.MERGED:
+            types = [o["type"] for o in r.objs]
+            self.assertEqual(types.count("last-prompt"), 1)          # 只有結尾那條新的
+            self.assertEqual(types[-1], "last-prompt")
+            self.assertNotIn("m1", self._uuids(r.objs))              # 畸形 meta 行沒被搬進 union
+            self.assertNotEqual(r.chosen_tip, "m1")                  # 更不可能被選成 tip
+            self.assertNotIn("m1", {lf.uuid for lf in r.leaves})     # 也不得出現在互動候選清單
+        else:                                                        # 或 fail-closed 退回人工挑選
+            self.assertNotIn("m1", {lf.uuid for lf in r.leaves})
+
+    def test_uuid_conflict_hidden_behind_meta_line_falls_back(self):
+        # codex g7：同 uuid x1 一側是 meta 行、另一側是真對話行（hash 相異＝歷史被改寫）。union 在 _emit
+        # 前就濾掉 meta 行 → 原本的衝突偵測（_emit）永遠看不到它。須在濾行**之前**鏡射 classify 的
+        # uuid_hashes 判準，讓 merge_sessions 單獨呼叫時也守得住（正常路徑另有 classify DAMAGED 先擋）。
+        r = merge_sessions(self._shape(fx.uuid_x1_as_meta_line()), self._shape(fx.uuid_x1_as_real_line()))
+        self.assertEqual(r.outcome, MergeOutcome.FALLBACK)
+        self.assertIn("異 hash", r.reason)
+        self.assertIsNone(r.objs)
+
+    def test_orphan_single_root_falls_back(self):
+        # codex g4 反例②：被丟棄的 meta 行正是根的父親 → 孤兒遞補成**唯一**的根 → 「根數 >1」檢查漏接 →
+        # 會 MERGED 出 parent 指向不存在 uuid 的斷鏈檔。須以「父親是否被丟棄」直接判定並退回挑選。
+        r = merge_sessions(self._shape(fx.orphan_single_root_local()),
+                           self._shape(fx.orphan_single_root_hub()))
+        self.assertEqual(r.outcome, MergeOutcome.FALLBACK)
+        self.assertIsNone(r.objs)
+
+    def test_child_under_dropped_meta_line_falls_back(self):
+        # union 不搬帶 uuid 的 meta 行 → 掛在它底下的真對話行會失去父親。此時**不可**靜默產出斷鏈 DAG，
+        # 須 fail-closed 退回人工挑選（實測：多個非-system 對話根 → FALLBACK）。
+        r = merge_sessions(self._shape(fx.linear()), self._shape(fx.child_under_meta_line()))
+        self.assertEqual(r.outcome, MergeOutcome.FALLBACK)
+        self.assertIsNone(r.objs)
+
     def test_fresh_lastprompt_ignores_stale_input_tip(self):
         # stale_rewind：last-prompt 落後指 u3，但 u9 較新。union 重算 → 指 u9，不沿用 stale tip（B2）。
         r = merge_sessions(self._shape(fx.linear()), self._shape(fx.stale_rewind_of_linear()))

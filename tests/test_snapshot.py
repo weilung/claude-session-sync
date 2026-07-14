@@ -94,6 +94,12 @@ class TestDecisionSnapshot(unittest.TestCase):
         self.state.local_dir_bindings[self.ld.name] = "encH"
         self.assertNotEqual(before, self._snap())
 
+    def test_state_entry_changes_on_dir_assertion(self):
+        # 斷言夾（--map 斷言整夾，2026-07-14）的身分解析繞過 cwd 檢查 → 斷言的授予/撤銷須令快照失效（對稱 dir_binding）。
+        before = self._snap()
+        self.state.asserted_dirs.add(self.ld.name)
+        self.assertNotEqual(before, self._snap())
+
     def test_missing_side_is_absent_token(self):
         snap = compute_decision_snapshot(
             session_id="ghost", local_project_dir=None, hub_project_dir=self.hd,

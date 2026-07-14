@@ -27,7 +27,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from .canonical import Line, canon_dumps
-from .lineset import VOLATILE_META_TYPES, SessionShape
+from .lineset import (
+    VOLATILE_META_TYPES,
+    SessionShape,
+    genuine_leaves_of,
+    has_parent_cycle,
+    meta_node_uuids,
+)
 
 
 class MergeOutcome(str, Enum):
@@ -53,11 +59,14 @@ class MergeResult:
 
 
 def _is_content_line(ln: Line) -> bool:
-    """納入 union 的內容行：uuid 行一律算；no-uuid 只算**非揮發** meta（summary 等內容行）。
+    """納入 union 的內容行 = **非揮發 meta 的行**（uuid 行、summary 等內容 no-uuid 行）。
 
-    與 lineset._counts_for_compare 同準則——揮發 meta（last-prompt/mode/title…）不進 union，
-    結尾另 append 一條新 last-prompt。"""
-    return bool(ln.uuid) or (ln.type not in VOLATILE_META_TYPES)
+    揮發 meta（last-prompt/mode/title…）不進 union，結尾另 append 一條新 last-prompt。
+    **即使它畸形地帶了 uuid 也不進**（codex g3）：舊述詞 `bool(ln.uuid) or …` 會把帶 uuid 的 meta 行
+    當內容搬進 union，並讓它成為 leaf 候選 → 自動選中它當 tip → 合併檔的游標指向一條 metadata。
+    與 `lineset._counts_for_compare`（比較用；uuid 行一律計入）**刻意不同**：比較端計入 → 兩側若差這種
+    畸形行仍會顯示為 fork/superset（交人、不靜默），但 union **產出**端不搬運簿記行。"""
+    return ln.type not in VOLATILE_META_TYPES
 
 
 def _idkey(ln: Line) -> tuple[str, str]:
@@ -72,17 +81,7 @@ def _common_prefix_len(a: list[Line], b: list[Line]) -> int:
     return k
 
 
-def _has_cycle(parent_map: dict[str, str | None]) -> bool:
-    """parent 鏈是否含環（沿 parentUuid 往上走重複造訪即環）。"""
-    for start in parent_map:
-        seen: set[str] = set()
-        cur: str | None = start
-        while cur is not None and cur in parent_map:
-            if cur in seen:
-                return True
-            seen.add(cur)
-            cur = parent_map[cur]
-    return False
+_has_cycle = has_parent_cycle   # 單一真相源移至 lineset（classify 也要用）；此名保留供本模組既有呼叫端
 
 
 def merge_sessions(
@@ -96,6 +95,18 @@ def merge_sessions(
         return MergeResult(MergeOutcome.FALLBACK, "至少一側無對話 uuid，無法 union（退回挑選）")
     if not (local.uuids & hub.uuids):
         return MergeResult(MergeOutcome.FALLBACK, "零共同 uuid（無共同祖先 / collision），不可 union（退回挑選）")
+
+    # 跨檔同 uuid 異 hash（歷史行被改寫）→ 不可 union。**必須在濾行之前**檢查（codex g7）：union 不搬揮發
+    # meta 行，若某 uuid 在一側是 meta 行、另一側是真對話行，衝突就永遠到不了下方 `_emit` 的偵測 →
+    # 防線消失。此處鏡射 `classify` 的同一判準（`uuid_hashes` 涵蓋所有 uuid 行、含 meta 行），
+    # 使 `merge_sessions` 單獨呼叫時也守得住（正常路徑 classify 已先判 DAMAGED，此為第二層）。
+    for u in local.uuids & hub.uuids:
+        lh, hh = local.uuid_hashes.get(u, set()), hub.uuid_hashes.get(u, set())
+        if lh and hh and lh.isdisjoint(hh):
+            return MergeResult(
+                MergeOutcome.FALLBACK,
+                f"跨檔同 uuid 異 hash（{u[:8]} 歷史行被改寫），不可 union（退回挑選）",
+            )
 
     a = [ln for ln in local.lines if _is_content_line(ln)]
     b = [ln for ln in hub.lines if _is_content_line(ln)]
@@ -132,11 +143,24 @@ def merge_sessions(
         if not _emit(ln):
             return MergeResult(MergeOutcome.FALLBACK, f"同 uuid 異 hash（{ln.uuid[:8]} 歷史行被改寫），不可 union")
 
-    # ── (5) 合併後結構檢查：多非-system 根 / parent 環 → 退回挑選 ───────────────
+    # ── (5) 合併後結構檢查：斷鏈 / 多非-system 根 / parent 環 → 退回挑選 ─────────
     merged_uuids = {ln.uuid for ln in out if ln.uuid}
     parent_map = {ln.uuid: ln.parent for ln in out if ln.uuid}
     if _has_cycle(parent_map):
         return MergeResult(MergeOutcome.FALLBACK, "合併後 parent 鏈成環（不可解），退回挑選")
+
+    # 被我們丟棄的揮發 meta 行若正是某內容行的父親 → union 會產出 parent 指向不存在 uuid 的**斷鏈**檔。
+    # 「多非-system 根」只是這件事的**間接**訊號：若被丟的正好是根的父親，孤兒自己遞補成唯一的根 → 根數
+    # 仍是 1 → 檢查漏接（codex g4 實證）。改為直接檢查「父親是否被我們丟掉」，精準 fail-closed。
+    # 被丟棄的 uuid ＝ 帶 uuid 的揮發 meta 行（`meta_node_uuids`＝與 classify 共用的單一真相源；
+    # 勿在此重新定義一次「什麼行不算對話節點」→ 又一次述詞漂移）。
+    dropped_uuids = meta_node_uuids([*local.lines, *hub.lines])
+    orphaned = [ln for ln in out if ln.parent and ln.parent in dropped_uuids]
+    if orphaned:
+        return MergeResult(
+            MergeOutcome.FALLBACK,
+            f"內容行的父親是被丟棄的揮發 meta 行（{orphaned[0].parent[:8]}）→ union 會斷鏈，退回挑選",
+        )
     nonsystem_roots = [
         ln for ln in out
         if ln.uuid and (ln.parent is None or ln.parent not in merged_uuids) and ln.type != "system"
@@ -147,12 +171,9 @@ def merge_sessions(
             "合併後出現多個非-system 對話根（疑似併入不相關對話），退回挑選",
         )
 
-    # genuine leaves = 未被任何行當 parent、非 sidechain、非工具 fan-out 的 uuid 行。
-    used_as_parent = {ln.parent for ln in out if ln.parent}
-    leaf_lines = [
-        ln for ln in out
-        if ln.uuid and ln.uuid not in used_as_parent and not ln.is_sidechain and not ln.is_tool_fanout
-    ]
+    # genuine leaves：用 lineset 的**單一真相源**述詞（勿再複製一份 → 會與 classify 的 ff 判定漂移，
+    # codex g3 實證：舊的本地副本沒排除揮發 meta → union 挑中 meta 行當 tip）。
+    leaf_lines = genuine_leaves_of(out)
     if not leaf_lines:
         return MergeResult(MergeOutcome.FALLBACK, "合併後無 genuine leaf，退回挑選")
     leaves = [LeafCandidate(ln.uuid, ln.ts) for ln in leaf_lines]

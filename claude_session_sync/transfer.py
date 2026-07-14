@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import anomaly, atomicio, scan, tombstone
+from . import anomaly, atomicio, pathsafe, scan, tombstone
 from .anomaly import Anomaly
 from .classify import classify
 from .lineset import SessionShape, analyze, analyze_bytes
@@ -108,8 +108,9 @@ class TransferReport:
 
 
 def _safe_name(name: str) -> bool:
-    """`--map` 目標夾名須是 remote_root 底下單一安全夾名（擋逃出信任根，比照 bootstrap）。"""
-    return bool(name) and name == Path(name).name and name not in (".", "..")
+    """`--map` 目標夾名須是 remote_root 底下單一安全夾名（擋逃出信任根，比照 bootstrap）。委派
+    `pathsafe.safe_leaf_name`（單一真相源；另擋 Windows 保留名/非法字元/尾隨點空白，codex mcwd-r1 F3）。"""
+    return pathsafe.safe_leaf_name(name)
 
 
 def _sidecar_digest(remote_dir: Path) -> str:
@@ -257,10 +258,9 @@ def plan_transfer(
     matched = [p for p in projects if p.identity == "match"]
 
     def _rkey(rd: str | None) -> str:
-        try:
-            return str(Path(rd).resolve()) if rd else ""
-        except OSError:
-            return rd or ""   # 解析失敗 → 退回字串（該夾另會被 `_safe_project_dir` 擋下）
+        # 實體 canonical 鍵（junction 別名/casefold 孿生/皆不存在的 Hub vs hub 統一，mcwd-g2 #4 + g4 #1）；
+        # 單一真相源在 pathsafe（bootstrap/scan 的 dup 防線同一把）。
+        return pathsafe.physical_dup_key(rd) if rd else ""
 
     keyed = [(p, _rkey(p.remote_dir)) for p in matched]
     dup_targets = {k for k, n in Counter(k for _, k in keyed).items() if n > 1}
@@ -330,6 +330,8 @@ def _apply_one(
         return TransferOutcome(sid, action, "skipped-stale", f"鎖疑似陳舊，交人工：{e}")
     except atomicio.LockError as e:
         return TransferOutcome(sid, action, "skipped-locked", f"取鎖逾時，略過：{e}")
+    except OSError as e:   # 純 OSError（碟片被拔/唯讀/權限）→ 逐檔回報，不 traceback（codex g11，同 apply）
+        return TransferOutcome(sid, action, "error", f"取鎖失敗（碟片不可用/唯讀/權限？）：{atomicio._disp(str(e))}")
     try:
         # 鎖內**再驗** symlink/逃逸（TOCTOU：pre-lock 檢查後夾/檔可能被換成 reparse）+ 拒 symlink session 檔
         # ——確保 lock 後實際讀/寫的路徑解析後仍在 root 內，不沿 symlink 讀/寫到信任根外（codex r-transfer-1/3 + e2e）。

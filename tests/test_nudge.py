@@ -259,9 +259,12 @@ class TestNudgeCli(unittest.TestCase):
     def test_text_encoding_error_is_silent(self):
         # codex R1 Medium：--text 原樣中文在 ascii stdout 會拋 UnicodeEncodeError → 輸出在 try 內 → 靜默 exit 0，
         # 不得以 traceback 非零退出破壞 fail-silent。
+        # main() 平時會先把 stdout 轉 UTF-8（此情境因此幾乎不會發生）；這裡停用它，直球測 fail-silent 那張網
+        # ——轉換失敗（stdout 非 TextIOWrapper）時仍須靜默。
         self._conflict()
         buf = io.TextIOWrapper(io.BytesIO(), encoding="ascii", errors="strict", newline="")
-        with mock.patch.object(cli.config_mod, "load", return_value=Config()), \
+        with mock.patch.object(cli, "_utf8_output", lambda: None), \
+                mock.patch.object(cli.config_mod, "load", return_value=Config()), \
                 contextlib.redirect_stdout(buf):
             code = cli.main(["nudge", "--text", "--hub", str(self.hub),
                              "--local-root", str(self.local), "--state", str(self.state)])

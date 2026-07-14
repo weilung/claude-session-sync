@@ -82,10 +82,12 @@ def state_entry_hash(state: State | None, project_key: str | None, sid: str, cwd
     local_known = bool(state and project_key is not None and sid in state.local_sessions.get(project_key, set()))
     binding = state.bindings.get(cwd) if (state and cwd is not None) else None
     # 夾名綁定也納入：空夾（cwd=None）的身分解析改靠 local_dir_bindings，故其變動（並發 remap）須能令快照失效，
-    # 與 cwd-binding 對稱（codex r26-2）。
+    # 與 cwd-binding 對稱（codex r26-2）。斷言旗標同理：asserted 夾（--map 斷言整夾，2026-07-14）的身分解析
+    # 繞過 cwd 檢查，故斷言的授予/撤銷也須令快照失效。
     dir_binding = state.local_dir_bindings.get(local_dir_name) if (state and local_dir_name is not None) else None
+    dir_asserted = bool(state and local_dir_name is not None and local_dir_name in state.asserted_dirs)
     payload = {"pk": project_key, "sid": sid, "known": known, "local_known": local_known,
-               "binding": binding, "dir_binding": dir_binding}
+               "binding": binding, "dir_binding": dir_binding, "dir_asserted": dir_asserted}
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
